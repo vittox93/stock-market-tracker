@@ -1,179 +1,151 @@
 """
-Stock Market Tracker - Main Application
-Tracks real-time stock prices using free APIs
+Stock Market Tracker - Main Application (improved for Finnhub)
+- Uses config.get_finnhub_key() to read the API key
+- Adds retry with exponential backoff (tenacity)
+- Adds simple caching (cachetools TTLCache) to respect rate limits
+- Uses requests.Session for connection pooling
 """
 
 import os
+import logging
 import requests
 import pandas as pd
 from datetime import datetime
 from dotenv import load_dotenv
+from tenacity import retry, wait_exponential, stop_after_attempt
+from cachetools import TTLCache, cached
 
-# Load environment variables
+from config import get_finnhub_key, FINNHUB_BASE_URL
+
+# Load environment variables from .env if present
 load_dotenv()
 
+logger = logging.getLogger(__name__)
+logging.basicConfig(level=logging.INFO)
+
+# Session for HTTP connections
+_session = requests.Session()
+
+# Simple in-memory TTL cache: cache Finnhub quote responses for 60 seconds
+_CACHE = TTLCache(maxsize=1024, ttl=60)
+
+
+@retry(wait=wait_exponential(min=1, max=10), stop=stop_after_attempt(4))
+@cached(_CACHE)
+def _fetch_finnhub_quote(symbol: str):
+    """Fetch raw quote from Finnhub and cache the result per-symbol.
+
+    Note: token is read at call-time so we don't embed secrets into cache keys.
+    """
+    token = get_finnhub_key()
+    url = f"{FINNHUB_BASE_URL}/quote"
+    params = {"symbol": symbol, "token": token}
+
+    logger.debug("Requesting Finnhub for %s", symbol)
+    resp = _session.get(url, params=params, timeout=10)
+    resp.raise_for_status()
+    return resp.json()
+
+
 class StockTracker:
-    """Main class for tracking stock market data"""
-    
+    """Main class for tracking stock market data (Finnhub-focused improvements)"""
+
     def __init__(self):
-        self.alpha_vantage_key = os.getenv('ALPHA_VANTAGE_API_KEY')
+        # Do not raise at init — read key when needed. Keep attributes for compatibility.
         self.finnhub_key = os.getenv('FINNHUB_API_KEY')
-        self.base_url_alpha = 'https://www.alphavantage.co/query'
-        self.base_url_finnhub = 'https://finnhub.io/api/v1'
+        self.base_url_finnhub = FINNHUB_BASE_URL
         self.stocks_data = []
-    
-    def get_stock_price_alpha_vantage(self, symbol):
-        """
-        Fetch stock price using Alpha Vantage API
-        
-        Args:
-            symbol (str): Stock symbol (e.g., 'AAPL')
-        
-        Returns:
-            dict: Stock data including price, timestamp
+
+    def get_stock_price_finnhub(self, symbol: str):
+        """Fetch stock price using Finnhub API with caching and retry.
+
+        Returns a dict with keys compatible with the UI: symbol, price, change, high, low, open, previous_close, timestamp, source
         """
         try:
-            params = {
-                'function': 'GLOBAL_QUOTE',
-                'symbol': symbol,
-                'apikey': self.alpha_vantage_key
-            }
-            
-            response = requests.get(self.base_url_alpha, params=params, timeout=10)
-            response.raise_for_status()
-            data = response.json()
-            
-            if 'Global Quote' in data and data['Global Quote']:
-                quote = data['Global Quote']
-                return {
-                    'symbol': symbol,
-                    'price': float(quote.get('05. price', 0)),
-                    'change': float(quote.get('09. change', 0)),
-                    'change_percent': quote.get('10. change percent', 'N/A'),
-                    'timestamp': datetime.now().isoformat(),
-                    'source': 'Alpha Vantage'
-                }
-            else:
-                print(f"No data found for {symbol}")
+            data = _fetch_finnhub_quote(symbol)
+
+            # Finnhub returns keys: c (current), h (high), l (low), o (open), pc (previous close)
+            if not data or 'c' not in data:
+                logger.warning("No Finnhub data for %s: %s", symbol, data)
                 return None
-        
-        except requests.RequestException as e:
-            print(f"Error fetching data from Alpha Vantage: {e}")
-            return None
-    
-    def get_stock_price_finnhub(self, symbol):
-        """
-        Fetch stock price using Finnhub API
-        
-        Args:
-            symbol (str): Stock symbol (e.g., 'AAPL')
-        
-        Returns:
-            dict: Stock data including price, timestamp
-        """
-        try:
-            params = {
+
+            current = data.get('c', 0)
+            prev_close = data.get('pc', 0) or 0
+            change = None
+            try:
+                change = float(current) - float(prev_close)
+            except Exception:
+                change = 0.0
+
+            return {
                 'symbol': symbol,
-                'token': self.finnhub_key
+                'price': float(current),
+                'high': float(data.get('h', 0) or 0),
+                'low': float(data.get('l', 0) or 0),
+                'open': float(data.get('o', 0) or 0),
+                'previous_close': float(prev_close),
+                'change': change,
+                'change_percent': f"{(change / prev_close * 100):.2f}%" if prev_close else 'N/A',
+                'timestamp': datetime.now().isoformat(),
+                'source': 'Finnhub'
             }
-            
-            response = requests.get(f'{self.base_url_finnhub}/quote', params=params, timeout=10)
-            response.raise_for_status()
-            data = response.json()
-            
-            if 'c' in data:  # current price
-                return {
-                    'symbol': symbol,
-                    'price': data.get('c', 0),
-                    'high': data.get('h', 0),
-                    'low': data.get('l', 0),
-                    'open': data.get('o', 0),
-                    'previous_close': data.get('pc', 0),
-                    'timestamp': datetime.now().isoformat(),
-                    'source': 'Finnhub'
-                }
-            else:
-                print(f"No data found for {symbol}")
-                return None
-        
-        except requests.RequestException as e:
-            print(f"Error fetching data from Finnhub: {e}")
+
+        except requests.HTTPError as e:
+            logger.error("HTTP error fetching Finnhub for %s: %s", symbol, e)
             return None
-    
-    def add_stock(self, symbol, source='alpha_vantage'):
-        """
-        Add stock to tracker
-        
-        Args:
-            symbol (str): Stock symbol
-            source (str): API source ('alpha_vantage' or 'finnhub')
-        """
-        if source == 'alpha_vantage':
-            data = self.get_stock_price_alpha_vantage(symbol)
-        elif source == 'finnhub':
+        except Exception as e:
+            logger.exception("Unexpected error fetching Finnhub for %s: %s", symbol, e)
+            return None
+
+    def add_stock(self, symbol: str, source: str = 'finnhub'):
+        """Add a stock to the in-memory portfolio. Defaults to Finnhub."""
+        source = source.lower() if source else 'finnhub'
+
+        if source == 'finnhub':
             data = self.get_stock_price_finnhub(symbol)
         else:
-            print(f"Unknown source: {source}")
+            logger.error("Unknown source requested: %s", source)
             return
-        
+
         if data:
+            # Keep a consistent shape with previous implementation
             self.stocks_data.append(data)
-            print(f"✓ Added {symbol}: ${data['price']}")
+            logger.info("Added %s: $%s", symbol, data.get('price'))
         else:
-            print(f"✗ Failed to add {symbol}")
-    
+            logger.info("Failed to add %s", symbol)
+
     def get_portfolio(self):
-        """Get current portfolio data as DataFrame"""
+        """Return current portfolio as a pandas DataFrame or empty DataFrame"""
         if not self.stocks_data:
-            print("Portfolio is empty")
-            return None
-        
-        df = pd.DataFrame(self.stocks_data)
-        return df
-    
+            return pd.DataFrame()
+        return pd.DataFrame(self.stocks_data)
+
     def display_portfolio(self):
-        """Display portfolio in formatted table"""
         df = self.get_portfolio()
-        if df is not None:
-            print("\n" + "="*60)
-            print("STOCK MARKET TRACKER - PORTFOLIO")
-            print("="*60)
-            print(df.to_string(index=False))
-            print("="*60 + "\n")
-    
+        if df.empty:
+            logger.info("Portfolio is empty")
+            return
+        print(df.to_string(index=False))
+
     def save_to_csv(self, filename='portfolio.csv'):
-        """Save portfolio to CSV file"""
         df = self.get_portfolio()
-        if df is not None:
+        if not df.empty:
             df.to_csv(filename, index=False)
-            print(f"Portfolio saved to {filename}")
+            logger.info("Saved portfolio to %s", filename)
 
 
 def main():
-    """Main application entry point"""
-    print("🚀 Stock Market Tracker Started\n")
-    
-    # Initialize tracker
+    print("🚀 Stock Market Tracker (Finnhub) Started\n")
     tracker = StockTracker()
-    
-    # Check if API keys are configured
-    if not tracker.alpha_vantage_key and not tracker.finnhub_key:
-        print("⚠️  Warning: No API keys configured!")
-        print("Please add your API keys to .env file")
-        print("See .env.example for configuration template\n")
-    
-    # Example: Track popular stocks
+
+    if not tracker.finnhub_key:
+        print("⚠️  Warning: FINNHUB_API_KEY non configurata. Aggiungi la chiave a .env o come variabile d'ambiente.")
+
     stocks_to_track = ['AAPL', 'GOOGL', 'MSFT', 'TSLA', 'AMZN']
-    
-    print(f"Tracking {len(stocks_to_track)} stocks using Alpha Vantage API...\n")
-    
-    for stock in stocks_to_track:
-        tracker.add_stock(stock, source='alpha_vantage')
-    
-    # Display portfolio
+    for s in stocks_to_track:
+        tracker.add_stock(s, source='finnhub')
+
     tracker.display_portfolio()
-    
-    # Save to CSV
     tracker.save_to_csv('portfolio.csv')
 
 
